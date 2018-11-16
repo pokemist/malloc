@@ -2,227 +2,149 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>
 
-typedef struct block {
-    size_t        size;
-    struct block   *next;
-    struct block   *prev;
-}        block_t;
+typedef struct memBlock {
+    int        size;
+    struct memBlock   *prev;
+    struct memBlock   *next;
+}        memBlock;
 
-#ifndef ALLOC_UNIT
-#define ALLOC_UNIT 3 * sysconf(_SC_PAGESIZE)
-#endif
+static memBlock *head = NULL;
+void* heap = NULL;
 
-#ifndef MIN_DEALLOC
-#define MIN_DEALLOC 1 * sysconf(_SC_PAGESIZE)
-#endif
-
-#define BLOCK_MEM(ptr) ((void *)((unsigned long)ptr + sizeof(block_t)))
-#define BLOCK_HEADER(ptr) ((void *)((unsigned long)ptr - sizeof(block_t)))
-
-static block_t *head = NULL;
-void stats(char *prefix);
-/* fl_remove removes a block from the free list
- * and adjusts the head accordingly */
-void
-fl_remove(block_t * b)
-{
-    if (!b->prev) {
-        if (b->next) {
-            head = b->next;
-        } else {
-            head = NULL;
-        }
-    } else {
-        b->prev->next = b->next;
+//Remove memBlock b from the free linked list, while keeping order by address
+void free_remove(memBlock* b){
+    //If there is no free memory block before b
+    if(!b->prev){
+        //If there is a free memory block after b set head after b
+        if(b->next) head = b->next;
+        //Else set head to NULL
+        else head = NULL;
     }
-    if (b->next) {
-        b->next->prev = b->prev;
-    }
+    //Else set b->next as b->prev's next node
+    else b->prev->next = b->next;
+    //If there is a free memory block after b, set it as the previous node for b->next
+    if(b->next) b->next->prev = b->prev;
 }
 
-/* fl_add adds a block to the free list keeping
- * the list sorted by the block begin address,
- * this helps when scanning for continuous blocks */
-void
-fl_add(block_t * b)
-{
+//Add memBlock b to the free linked list, while keeping order by address
+void free_add(memBlock* b){
     b->prev = NULL;
     b->next = NULL;
-    if (!head || (unsigned long)head > (unsigned long)b) {
-        if (head) {
-            head->prev = b;
-        }
+    //If the address of b is before head's address and make it the new head
+    if(!head || (unsigned long) head > (unsigned long)b){
+        if(head) head->prev = b;
         b->next = head;
         head = b;
-    } else {
-        block_t        *curr = head;
-        while (curr->next
-               && (unsigned long)curr->next < (unsigned long)b) {
-            curr = curr->next;
-        }
-        b->next = curr->next;
-        curr->next = b;
+    }
+    else{
+        memBlock* itr = head;
+        //Go through the linked list until you find the correct address to put b in
+        while(itr->next && (unsigned long)itr->next < (unsigned long)b) itr = itr->next;
+        //Put b in that spot
+        b->next = itr->next;
+        itr->next = b;
     }
 }
 
-/* scan_merge scans the free list in order to find
- * continuous free blocks that can be merged and also
- * checks if our last free block ends where the program
- * break is. If it does, and the free block is larger then
- * MIN_DEALLOC then the block is released to the OS, by
- * calling brk to set the program break to the begin of
- * the block */
-void
-scan_merge()
-{
-    block_t        *curr = head;
-    unsigned long    header_curr, header_next;
-    unsigned long    program_break = (unsigned long)sbrk(0);
-    if (program_break == 0) {
-        printf("failed to retrieve program break\n");
-        return;
-    }
-    while (curr->next) {
-        header_curr = (unsigned long)curr;
-        header_next = (unsigned long)curr->next;
-        if (header_curr + curr->size + sizeof(block_t) == header_next) {
-            /* found two continuous addressed blocks, merge them
-             * and create a new block with the sum of their sizes */
-            curr->size += curr->next->size + sizeof(block_t);
-            curr->next = curr->next->next;
-            if (curr->next) {
-                curr->next->prev = curr;
-            } else {
-                break;
-            }
+//Go through the linked list and merge memory blocks with consecutive memory addresses
+void merge(){
+    memBlock* itr = head;
+    unsigned long header_itr, header_next;
+    //Iterate through the linked list
+    while(itr->next){
+        header_itr = (unsigned long)itr;
+        header_next = (unsigned long)itr->next;
+        
+        //If the addresses are continuous merge them
+        if(header_itr + (itr->size) + sizeof(memBlock) == header_next){
+            itr->size += itr->next->size;
+            itr->next = itr->next->next;
+            if(itr->next) itr->next->prev = itr;
+            else break;
         }
-        curr = curr->next;
-    }
-    stats("after merge");
-    header_curr = (unsigned long)curr;
-    /* last check if our last free block ends on the program break and is
-     * big enough to be released to the OS (this check is to reduce the
-     * number of calls to sbrk/brk */
-    if (header_curr + curr->size + sizeof(block_t) == program_break
-        && curr->size >= MIN_DEALLOC) {
-        fl_remove(curr);
-        if (brk(curr) != 0) {
-            printf("error freeing memory\n");
-        }
+        itr = itr->next;
     }
 }
 
-/* stats prints some debug information regarding the
- * current program break and the blocks on the free list */
-void
-stats(char *prefix)
-{
-    printf("[%s] program break: %10p\n", prefix, sbrk(0));
-    block_t        *ptr = head;
-    printf("[%s] free list: \n", prefix);
-    int        c = 0;
-    while (ptr) {
-        printf("(%d) <%10p> (size: %ld)\n", c, ptr, ptr->size);
-        ptr = ptr->next;
-        c++;
-    }
-}
-
-/* splits the block b by creating a new block after size bytes,
- * this new block is returned */
-block_t * split(block_t * b, size_t size)
-{
-    void           *mem_block = BLOCK_MEM(b);
-    block_t        *newptr = (block_t *) ((unsigned long)mem_block + size);
-    newptr->size = b->size - (size + sizeof(block_t));
+//Splits the memory block b into one with the specified size and the leftovers
+memBlock* split(memBlock* b, int size){
+    //make new memBlock with size of memBlock b
+    void* newMemBlock = ((void *)((unsigned long)b + sizeof(memBlock)));
+    //make new pointer at memBlock address
+    memBlock* newPtr = (memBlock*) ((unsigned long)newMemBlock + size);
+    //set new pointer's size equal to the left over size of memory)
+    newPtr->size = b->size - size;
+    //set b size to specified size
     b->size = size;
-    return newptr;
+    return newPtr;
 }
 
-void           *
-_malloc(size_t size)
-{
-    void           *block_mem;
-    block_t        *ptr, *newptr;
-    size_t        alloc_size = size >= ALLOC_UNIT ? size + sizeof(block_t)
-    : ALLOC_UNIT;
-    ptr = head;
-    while (ptr) {
-        if (ptr->size >= size + sizeof(block_t)) {
-            block_mem = BLOCK_MEM(ptr);
-            fl_remove(ptr);
-            if (ptr->size == size) {
-                // we found a perfect sized block, return it
-                return block_mem;
-            }
-            // our block is bigger then requested, split it and add
-            // the spare to our free list
-            newptr = split(ptr, size);
-            fl_add(newptr);
-            return block_mem;
-        } else {
-            ptr = ptr->next;
+//Allocates requested amount of memory, size
+void* myMalloc(int size){
+    void* newMemBlock;
+    memBlock *itr, *newPtr;
+    int allocSize = size + sizeof(memBlock);
+    itr = head;
+    while(itr){
+        if(itr->size >= size){
+            newMemBlock = ((void *)((unsigned long)itr + sizeof(memBlock)));
+            free_remove(itr);
+            if(itr->size == size) return newMemBlock;
+            newPtr = split(itr, size);
+            free_add(newPtr);
+            return newMemBlock;
         }
+        else itr = itr->next;
     }
-    /* We are unable to find a free block on our free list, so we
-     * should ask the OS for memory using sbrk. We will alloc
-     * more alloc_size bytes (probably way more than requested) and then
-     * split the newly allocated block to keep the spare space on our free
-     * list */
-    ptr = sbrk(alloc_size);
-    if (!ptr) {
-        printf("failed to alloc %ld\n", alloc_size);
-        return NULL;
-    }
-    ptr->next = NULL;
-    ptr->prev = NULL;
-    ptr->size = alloc_size - sizeof(block_t);
-    if (alloc_size > size + sizeof(block_t)) {
-        newptr = split(ptr, size);
-        fl_add(newptr);
-    }
-    return BLOCK_MEM(ptr);
+    //No free block in the free list left, push heap ptr and allocate memory
+    heap += allocSize;
+    itr = heap;
+    itr->next = NULL;
+    itr->prev = NULL;
+    itr->size = allocSize - sizeof(memBlock);
+    return ((void *)((unsigned long)itr + sizeof(memBlock)));
 }
 
-void
-_free(void *ptr)
-{
-    fl_add(BLOCK_HEADER(ptr));
-    stats("before scan");
-    scan_merge();
+//Removes the ptr from the linked list
+void myFree(void *ptr){
+    //Add ptr to the free linked list
+    free_add(((void *)((unsigned long)ptr - sizeof(memBlock))));
+    //Merge the free linked list
+    merge();
 }
 
-void
-_cleanup()
-{
-    printf("cleaning memory up\n");
-    if (head) {
-        if (brk(head) != 0) {
-            printf("failed to cleanup memory");
-        }
+//Prints out debugging information
+void debugInfo(char *prefix){
+    printf("[%s] \n", prefix);
+    printf("Heap pointer address: %p\n", heap);
+    int i = 0;
+    memBlock* itr = head;
+    printf("[%s] Free list: \n", prefix);
+    while (itr) {
+        printf("(%d) <%10p> (size: %i(%05x), total size: %i(%05x))\n", i, itr, itr->size, itr->size, itr->size + sizeof(memBlock), itr->size + sizeof(memBlock));
+        itr = itr->next;
+        i++;
     }
-    head = NULL;
-    stats("_cleanup end");
 }
 
-int
-main(int argc, char const *argv[])
-{
-    atexit(_cleanup);
-    printf("mem page size: %ld bytes\n", sysconf(_SC_PAGESIZE));
-    printf("bytes allocated per malloc: %ld\n", ALLOC_UNIT);
-    stats("begin main");
-    char           *str, *str2;
-    str = (char *)_malloc(1);
-    str2 = (char *)_malloc(1);
-    _free(str);
-    stats("1");
-    str = (char *)_malloc(2);
-    stats("2");
-    _free(str2);
-    _free(str);
-    stats("end main");
-    return (EXIT_SUCCESS);
+int main(int argc, char const *argv[]){
+    heap = sbrk(0);
+    printf("Size of memBlock: %i(%03x)\n", sizeof(memBlock), sizeof(memBlock));
+    debugInfo("No allocation");
+    char *ptr, *ptr2, *ptr3;
+    ptr = (char*)myMalloc(1);
+    debugInfo("Allocate ptr");
+    ptr3 = (char*)myMalloc(3);
+    debugInfo("Allocate ptr3");
+    myFree(ptr3);
+    debugInfo("Free ptr3");
+    myFree(ptr);
+    debugInfo("Free ptr1");
+    ptr2 = (char*)myMalloc(2);
+    debugInfo("Allocate ptr2");
+    myFree(ptr2);
+    debugInfo("Free ptr2");
+    return 0;
 }
-
