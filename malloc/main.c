@@ -116,12 +116,12 @@ void myFree(void *ptr){
 }
 
 //Prints out debugging information
-void debugInfo(char *prefix){
-    printf("[%s] \n", prefix);
+void debugInfo(char *index){
+    printf("[%s] \n", index);
     printf("Heap pointer address: %p\n", heap);
     int i = 0;
     memBlock* itr = head;
-    printf("[%s] Free list: \n", prefix);
+    printf("[%s] Free list: \n", index);
     while (itr) {
         printf("(%d) <%10p> (size: %i(%05x), total size: %i(%05x))\n", i, itr, itr->size, itr->size, itr->size + sizeof(memBlock), itr->size + sizeof(memBlock));
         itr = itr->next;
